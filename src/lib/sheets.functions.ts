@@ -38,18 +38,33 @@ export const loadTab = createServerFn({ method: "GET" })
     return { headers, rows, rowNumbers };
   });
 
-function buildRow(headers: string[], dateText: string, values: Record<string, number>) {
+function buildRow(
+  headers: string[],
+  dateText: string,
+  values: Record<string, number>,
+  existingCells?: string[],
+) {
   const salesSchema = schemaForHeaders(headers);
   const merged = { ...values };
+  // Preserve cells the form didn't submit (e.g. archived expense categories)
+  // so editing a row never wipes historical data.
+  if (existingCells) {
+    headers.forEach((h, ci) => {
+      if (ci === 0 || h === "TOTAL") return;
+      if (merged[h] === undefined) merged[h] = num(existingCells[ci]);
+    });
+  }
   if (salesSchema) {
     const r = reconcile(merged, salesSchema);
     merged["TOTAL"] = r.total;
     if (salesSchema.accessKey) merged[salesSchema.accessKey] = r.access;
     if (salesSchema.shortKey) merged[salesSchema.shortKey] = r.shot;
   } else {
+    // TOTAL covers every value column, including archived ones — their
+    // historical amounts still count toward the day's spend.
     merged["TOTAL"] = headers
       .slice(1)
-      .filter((h) => h !== "TOTAL" && !h.startsWith(ARCHIVE_PREFIX))
+      .filter((h) => h !== "TOTAL")
       .reduce((s, h) => s + num(merged[h]), 0);
   }
   return headers.map((h, i) => {
@@ -64,7 +79,10 @@ export const saveEntry = createServerFn({ method: "POST" })
     z
       .object({
         tab: tabSchema,
-        dateText: z.string().regex(/^\d{2}\/\d{2}\/\d{2}$/),
+        dateText: z
+          .string()
+          .regex(/^\d{2}\/\d{2}\/\d{2}$/)
+          .refine((s) => fromDDMMYY(s) !== null, { message: "Invalid calendar date" }),
         values: z.record(z.number()),
       })
       .parse(d),
@@ -81,7 +99,8 @@ export const saveEntry = createServerFn({ method: "POST" })
     const existingIndex = raw.findIndex((r, i) => i > 0 && (r[0] ?? "").trim() === data.dateText);
     if (existingIndex > 0) {
       const rowNumber = existingIndex + 1;
-      await updateRange(data.tab, `A${rowNumber}:${lastCol}${rowNumber}`, [rowValues]);
+      const updatedValues = buildRow(headers, data.dateText, data.values, raw[existingIndex]);
+      await updateRange(data.tab, `A${rowNumber}:${lastCol}${rowNumber}`, [updatedValues]);
       return { mode: "updated" as const, rowNumber };
     }
 
@@ -101,7 +120,22 @@ export const saveEntry = createServerFn({ method: "POST" })
       break;
     }
 
-    if (!lastCellIsTotal && lastDataCycleKey && lastDataCycleKey !== newCycle.key) {
+    // A cycle can already have its TOTAL row (e.g. a backdated entry appended
+    // after it was sealed) — never write a second one for the same cycle.
+    const totalRowExists = raw.slice(1).some((r) => {
+      const cell = (r[0] ?? "").trim();
+      if (!isTotalRow(cell)) return false;
+      const m = /(\d{1,2}\/\d{1,2}\/\d{2,4})/.exec(cell);
+      const d = m?.[1] ? fromDDMMYY(m[1]) : null;
+      return d ? cycleFor(d).key === lastDataCycleKey : false;
+    });
+
+    if (
+      !lastCellIsTotal &&
+      lastDataCycleKey &&
+      lastDataCycleKey !== newCycle.key &&
+      !totalRowExists
+    ) {
       const prevCycleRows = raw.slice(1).filter((r) => {
         const d = fromDDMMYY((r[0] ?? "").trim());
         return d ? cycleFor(d).key === lastDataCycleKey : false;
