@@ -138,7 +138,7 @@ function Hub() {
           expenses={expenses}
           cash={cash}
           onlineAmt={onlineAmt}
-          daysLogged={salesCycleRows.length}
+          daysLogged={new Set(salesCycleRows.map((r) => r.dateText)).size}
         />
 
         {active.usingCache && (

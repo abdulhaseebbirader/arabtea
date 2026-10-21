@@ -70,7 +70,11 @@ export function isArchived(header: string) {
 
 export function num(v: unknown): number {
   if (v === null || v === undefined) return 0;
-  const n = parseFloat(String(v).replace(/[^0-9.-]/g, ""));
+  const cleaned = String(v)
+    .trim()
+    .replace(/[₹$€£,\s]/g, "");
+  if (!/^-?\d+(\.\d+)?$/.test(cleaned)) return 0;
+  const n = parseFloat(cleaned);
   return Number.isFinite(n) ? n : 0;
 }
 
@@ -119,7 +123,12 @@ export function fromDDMMYY(s: string): Date | null {
   if (m) {
     const [, dd, mm, yy] = m;
     const year = yy!.length === 2 ? 2000 + Number(yy) : Number(yy);
-    return new Date(year, Number(mm) - 1, Number(dd));
+    const d = new Date(year, Number(mm) - 1, Number(dd));
+    // Reject overflows: JS Date rolls e.g. 31/02 into March instead of failing.
+    if (d.getFullYear() !== year || d.getMonth() !== Number(mm) - 1 || d.getDate() !== Number(dd)) {
+      return null;
+    }
+    return d;
   }
   // Fallback: Google Sheets may return a date serial number.
   if (/^\d{5}(\.\d+)?$/.test(t)) {
@@ -189,6 +198,15 @@ export function parseRows(data: SheetData): ParsedRow[] {
       if (ci === 0) return;
       values[h] = num(row[ci]);
     });
+    // Recompute TOTAL from its parts so a stale or hand-edited TOTAL cell
+    // in the sheet can't skew cycle sums or the history display.
+    if ("TOTAL" in values) {
+      let total = 0;
+      for (const [k, v] of Object.entries(values)) {
+        if (k !== "TOTAL") total += v;
+      }
+      values["TOTAL"] = total;
+    }
     out.push({ rowNumber: data.rowNumbers[i]!, date, dateText, values });
   });
   return out;
