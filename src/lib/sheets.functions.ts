@@ -199,66 +199,78 @@ export const repairTotals = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const fixed: { row: number; what: string }[] = [];
     const lastCol = (headers: string[]) => colLetter(headers.length - 1);
+    const read = async () => {
+      const raw = await getValues(data.tab);
+      const headers = (raw[0] ?? []).map((h) => h.trim());
+      return { raw, headers };
+    };
 
-    // Pass 1: fix wrong TOTAL cells in data rows and stale TOTAL summary rows.
-    let raw = await getValues(data.tab);
-    let headers = (raw[0] ?? []).map((h) => h.trim());
+    // Pass 1a: fix wrong TOTAL cells in data rows.
+    let { raw, headers } = await read();
+    const totalIdx = headers.indexOf("TOTAL");
     for (let i = 1; i < raw.length; i++) {
       const row = raw[i]!;
       const cell = (row[0] ?? "").trim();
-      if (!cell) continue;
-      const rowNumber = i + 1;
-      if (isTotalRow(cell)) {
-        const key = totalRowCycleKey(cell);
-        if (!key) continue;
-        const cycleRows = raw.slice(1).filter((r) => {
-          const d = fromDDMMYY((r[0] ?? "").trim());
-          return d ? cycleFor(d).key === key : false;
-        });
-        if (cycleRows.length === 0) continue;
-        const wanted = cycleTotals(headers, cycleRows);
-        const stale = headers.some((_, ci) => ci > 0 && num(row[ci]) !== num(wanted[ci]));
-        if (stale) {
-          wanted[0] = row[0] ?? cell;
-          await updateRange(data.tab, `A${rowNumber}:${lastCol(headers)}${rowNumber}`, [wanted]);
-          fixed.push({ row: rowNumber, what: `recomputed TOTAL row ${cell}` });
-        }
-        continue;
-      }
-      if (!fromDDMMYY(cell)) continue;
-      const storedTotal = num(row[headers.indexOf("TOTAL")]);
+      if (!cell || isTotalRow(cell) || !fromDDMMYY(cell)) continue;
+      const storedTotal = num(row[totalIdx]);
       const partsTotal = rowPartsSum(headers, row);
       if (Math.abs(storedTotal - partsTotal) > 0.5) {
         const fixedRow = headers.map((_, ci) =>
           ci === 0 ? `'${cell}` : headers[ci] === "TOTAL" ? partsTotal : (row[ci] ?? ""),
         );
+        const rowNumber = i + 1;
         await updateRange(data.tab, `A${rowNumber}:${lastCol(headers)}${rowNumber}`, [fixedRow]);
         fixed.push({ row: rowNumber, what: `TOTAL ${storedTotal} -> ${partsTotal}` });
       }
     }
 
+    // Pass 1b (re-read): fix stale TOTAL summary rows against corrected data.
+    ({ raw, headers } = await read());
+    for (let i = 1; i < raw.length; i++) {
+      const row = raw[i]!;
+      const cell = (row[0] ?? "").trim();
+      if (!isTotalRow(cell)) continue;
+      const key = totalRowCycleKey(cell);
+      if (!key) continue;
+      const cycleRows = raw.slice(1).filter((r) => {
+        const d = fromDDMMYY((r[0] ?? "").trim());
+        return d ? cycleFor(d).key === key : false;
+      });
+      if (cycleRows.length === 0) continue;
+      const wanted = cycleTotals(headers, cycleRows);
+      const stale = headers.some((_, ci) => ci > 0 && num(row[ci]) !== num(wanted[ci]));
+      if (stale) {
+        wanted[0] = row[0] ?? cell;
+        const rowNumber = i + 1;
+        await updateRange(data.tab, `A${rowNumber}:${lastCol(headers)}${rowNumber}`, [wanted]);
+        fixed.push({ row: rowNumber, what: `recomputed TOTAL row ${cell}` });
+      }
+    }
+
     // Pass 2 (re-read): insert a missing TOTAL summary row where a later cycle
     // already follows the last data row of a cycle.
-    raw = await getValues(data.tab);
-    headers = (raw[0] ?? []).map((h) => h.trim());
+    ({ raw, headers } = await read());
     const existingTotalKeys = new Set(
       raw
         .slice(1)
-        .map((r) => totalRowCycleKey((r[0] ?? "").trim()))
+        .map((r) => (r[0] ?? "").trim())
+        .filter((c) => isTotalRow(c))
+        .map((c) => totalRowCycleKey(c))
         .filter(Boolean),
     );
     let prevKey: string | null = null;
     let prevCycleRows: string[][] = [];
-    let prevLastRow = 0;
     for (let i = 1; i <= raw.length; i++) {
       const cell = (raw[i]?.[0] ?? "").trim();
       const d = cell && !isTotalRow(cell) ? fromDDMMYY(cell) : null;
       const key = d ? cycleFor(d).key : null;
-      if (key && key !== prevKey) {
+      if (!key) continue;
+      if (key !== prevKey) {
         // cycle boundary crossed: seal prevKey if it has no TOTAL row yet
         if (prevKey && !existingTotalKeys.has(prevKey) && prevCycleRows.length > 0) {
           const insertAt = i; // 0-based insert index = above current row
-          await insertRows(data.tab, insertAt, 2);
+          // [blank] [TOTAL] [blank] then the existing next-cycle row follows
+          await insertRows(data.tab, insertAt, 3);
           const totalRowNumber = insertAt + 2; // blank row then TOTAL row
           const totals = cycleTotals(headers, prevCycleRows);
           totals[0] = totalRowLabel(cycleFor(fromDDMMYY(prevCycleRows[0]![0]!.trim())!));
@@ -271,18 +283,13 @@ export const repairTotals = createServerFn({ method: "POST" })
           });
           fixed.push({ row: totalRowNumber, what: `inserted ${totals[0]}` });
           existingTotalKeys.add(prevKey);
-          raw = await getValues(data.tab);
-          headers = (raw[0] ?? []).map((h) => h.trim());
+          ({ raw, headers } = await read());
           i = insertAt + 1;
         }
         prevKey = key;
         prevCycleRows = [];
-        prevLastRow = i;
-      } else if (key) {
-        prevCycleRows.push(raw[i]!);
-        prevLastRow = i;
       }
-      void prevLastRow;
+      prevCycleRows.push(raw[i]!);
     }
     return { fixed };
   });
