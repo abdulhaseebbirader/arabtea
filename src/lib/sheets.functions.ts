@@ -171,6 +171,122 @@ export const saveEntry = createServerFn({ method: "POST" })
     return { mode: "appended" as const, rowNumber: entryRowNumber };
   });
 
+/* ------------------------- sheet data repair ----------------------------- */
+
+function rowPartsSum(headers: string[], row: string[]): number {
+  return headers.slice(1).reduce((s, h, i) => (h === "TOTAL" ? s : s + num(row[i + 1])), 0);
+}
+
+function totalRowCycleKey(cell: string): string | null {
+  const m = /(\d{1,2}\/\d{1,2}\/\d{2,4})/.exec(cell);
+  const d = m?.[1] ? fromDDMMYY(m[1]) : null;
+  return d ? cycleFor(d).key : null;
+}
+
+function cycleTotals(headers: string[], rows: string[][]): (string | number)[] {
+  return headers.map((h, ci) => (ci === 0 ? "" : rows.reduce((s, r) => s + num(r[ci]), 0)));
+}
+
+/**
+ * Repairs stored sheet data in place (values only, never deletes rows):
+ *  - data rows whose TOTAL cell doesn't equal the sum of its parts
+ *  - TOTAL summary rows whose column sums are stale
+ *  - a cycle that rolled over without ever getting its TOTAL summary row
+ * Call with { data: { tab: "TEA_SALES" | "TEA_EXPENSES" } }.
+ */
+export const repairTotals = createServerFn({ method: "POST" })
+  .validator((d: { tab: string }) => ({ tab: tabSchema.parse(d.tab) }))
+  .handler(async ({ data }) => {
+    const fixed: { row: number; what: string }[] = [];
+    const lastCol = (headers: string[]) => colLetter(headers.length - 1);
+
+    // Pass 1: fix wrong TOTAL cells in data rows and stale TOTAL summary rows.
+    let raw = await getValues(data.tab);
+    let headers = (raw[0] ?? []).map((h) => h.trim());
+    for (let i = 1; i < raw.length; i++) {
+      const row = raw[i]!;
+      const cell = (row[0] ?? "").trim();
+      if (!cell) continue;
+      const rowNumber = i + 1;
+      if (isTotalRow(cell)) {
+        const key = totalRowCycleKey(cell);
+        if (!key) continue;
+        const cycleRows = raw.slice(1).filter((r) => {
+          const d = fromDDMMYY((r[0] ?? "").trim());
+          return d ? cycleFor(d).key === key : false;
+        });
+        if (cycleRows.length === 0) continue;
+        const wanted = cycleTotals(headers, cycleRows);
+        const stale = headers.some((_, ci) => ci > 0 && num(row[ci]) !== num(wanted[ci]));
+        if (stale) {
+          wanted[0] = row[0] ?? cell;
+          await updateRange(data.tab, `A${rowNumber}:${lastCol(headers)}${rowNumber}`, [wanted]);
+          fixed.push({ row: rowNumber, what: `recomputed TOTAL row ${cell}` });
+        }
+        continue;
+      }
+      if (!fromDDMMYY(cell)) continue;
+      const storedTotal = num(row[headers.indexOf("TOTAL")]);
+      const partsTotal = rowPartsSum(headers, row);
+      if (Math.abs(storedTotal - partsTotal) > 0.5) {
+        const fixedRow = headers.map((_, ci) =>
+          ci === 0 ? `'${cell}` : headers[ci] === "TOTAL" ? partsTotal : (row[ci] ?? ""),
+        );
+        await updateRange(data.tab, `A${rowNumber}:${lastCol(headers)}${rowNumber}`, [fixedRow]);
+        fixed.push({ row: rowNumber, what: `TOTAL ${storedTotal} -> ${partsTotal}` });
+      }
+    }
+
+    // Pass 2 (re-read): insert a missing TOTAL summary row where a later cycle
+    // already follows the last data row of a cycle.
+    raw = await getValues(data.tab);
+    headers = (raw[0] ?? []).map((h) => h.trim());
+    const existingTotalKeys = new Set(
+      raw
+        .slice(1)
+        .map((r) => totalRowCycleKey((r[0] ?? "").trim()))
+        .filter(Boolean),
+    );
+    let prevKey: string | null = null;
+    let prevCycleRows: string[][] = [];
+    let prevLastRow = 0;
+    for (let i = 1; i <= raw.length; i++) {
+      const cell = (raw[i]?.[0] ?? "").trim();
+      const d = cell && !isTotalRow(cell) ? fromDDMMYY(cell) : null;
+      const key = d ? cycleFor(d).key : null;
+      if (key && key !== prevKey) {
+        // cycle boundary crossed: seal prevKey if it has no TOTAL row yet
+        if (prevKey && !existingTotalKeys.has(prevKey) && prevCycleRows.length > 0) {
+          const insertAt = i; // 0-based insert index = above current row
+          await insertRows(data.tab, insertAt, 2);
+          const totalRowNumber = insertAt + 2; // blank row then TOTAL row
+          const totals = cycleTotals(headers, prevCycleRows);
+          totals[0] = totalRowLabel(cycleFor(fromDDMMYY(prevCycleRows[0]![0]!.trim())!));
+          await updateRange(data.tab, `A${totalRowNumber}:${lastCol(headers)}${totalRowNumber}`, [
+            totals,
+          ]);
+          await formatRow(data.tab, totalRowNumber - 1, 0, headers.length, {
+            bold: true,
+            backgroundColor: { red: 1, green: 1, blue: 0.6 },
+          });
+          fixed.push({ row: totalRowNumber, what: `inserted ${totals[0]}` });
+          existingTotalKeys.add(prevKey);
+          raw = await getValues(data.tab);
+          headers = (raw[0] ?? []).map((h) => h.trim());
+          i = insertAt + 1;
+        }
+        prevKey = key;
+        prevCycleRows = [];
+        prevLastRow = i;
+      } else if (key) {
+        prevCycleRows.push(raw[i]!);
+        prevLastRow = i;
+      }
+      void prevLastRow;
+    }
+    return { fixed };
+  });
+
 /* --------------------- dynamic inventory column admin -------------------- */
 
 const invTab = z.enum(["TEA_EXPENSES"]);
